@@ -1,0 +1,348 @@
+#!/usr/bin/env python
+import logging
+import shutil
+
+import magic
+import mimetypes
+import os
+import re
+import sys
+import tempfile
+
+from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+from urllib.parse import urlparse, parse_qs
+
+from selenium import webdriver
+from selenium.webdriver import DesiredCapabilities
+
+from blogger_dl import Blog
+from cvm.controller import Browser
+from cvm.dom import Selector
+from cvm.view import Result
+
+parser = ArgumentParser(
+    description='BlogSpot Sync Tool',
+    formatter_class=ArgumentDefaultsHelpFormatter,
+)
+parser.add_argument(
+    '-o', '--output', action='store',
+    help='Output Directory',
+    default=os.path.join('%(domain)s', os.path.join('%(postId)s - %(title)s', '%(file)s.%(count)s.%(fmt)s'))
+)
+parser.add_argument(
+    '-p', '--pretend', action='store_true',
+    help='Pretend'
+)
+parser.add_argument(
+    '-f', '--full', action='store_true',
+    help='Full Archive'
+)
+parser.add_argument(
+    '-i', '--incremental', action='store_true',
+    help='Incremental Archive'
+)
+parser.add_argument(
+    '-s', '--skip', action='store_true',
+    help='Skip Errors'
+)
+parser.add_argument(
+    '-q', '--quiet', action='store_true',
+    help='Quiet Logging'
+)
+parser.add_argument(
+    '-v', '--verbose', action='store_true',
+    help='Verbose Logging'
+)
+parser.add_argument(
+    '-d', '--debug', action='store_true',
+    help='Debug Logging'
+)
+parser.add_argument(
+    'url', action='store',
+    help='Website Url',
+)
+
+if len(sys.argv) < 2:
+    parser.print_help()
+    exit(0)
+
+args = parser.parse_args()
+logging.basicConfig(
+    stream=sys.stdout,
+    level=logging.DEBUG if args.debug
+    else logging.INFO if args.verbose
+    else logging.ERROR if args.quiet
+    else logging.WARNING
+)
+
+logging.addLevelName(logging.DEBUG, "\033[1;32m%s\033[1;0m" % logging.getLevelName(logging.DEBUG))
+logging.addLevelName(logging.INFO, "\033[1;34m%s\033[1;0m" % logging.getLevelName(logging.INFO))
+logging.addLevelName(logging.WARNING, "\033[1;33m%s\033[1;0m" % logging.getLevelName(logging.WARNING))
+logging.addLevelName(logging.ERROR, "\033[1;31m%s\033[1;0m" % logging.getLevelName(logging.ERROR))
+log = logging.getLogger(__name__)
+
+dc = dict(DesiredCapabilities.PHANTOMJS)
+dc['phantomjs.page.settings.userAgent'] = 'Mozilla/5.0 (X11; Linux x86_64; rv:50.0) Gecko/20100101 Firefox/50.0'
+driver = webdriver.PhantomJS(
+    'phantomjs', desired_capabilities=dc
+)
+
+log.info('Initializing...')
+browser = Browser(driver)
+
+
+def handle_template(text: str, template: dict) -> str:
+    rep = dict((re.escape('%('+k+')s'), v) for k, v in template.items())
+    pattern = re.compile('|'.join(rep.keys()))
+    return pattern.sub(lambda m: rep[re.escape(m.group(0))], text)
+
+
+def handle_blog(url: str):
+    prev, next = handle_page(url)
+
+    reverse = prev
+    while reverse:
+        reverse, forward = handle_page(reverse)
+
+    forward = next
+    while forward:
+        reverse, forward = handle_page(forward)
+
+
+def handle_page(url: str):
+    delta = False
+
+    log.info('Loading: ' + url)
+    browser.url = url
+
+    log.info('Parsing: ' + url)
+    blog = browser.load(Blog())
+
+    log.info('Reading: ' + url)
+    for post in blog.posts:
+        delta |= handle_post(post)
+
+    prev, next = handle_pager(blog.pager)
+    return (prev, next) if args.full or args.incremental and delta else (None, None)
+
+
+def handle_pager(pager: Result):
+    log.info('pager: ' + '{' if pager else '')
+    if pager:
+        prev = pager.prev.attribute('href') if pager.prev else None
+        log.info('    prev: ' + str(prev))
+        next = pager.next.attribute('href') if pager.next else None
+        log.info('    next: ' + str(next))
+        log.info('}')
+        return prev, next
+    else:
+        log.warning('Missing pager')
+        return None, None
+
+
+def handle_post(post: Result):
+    delta = False
+
+    domain = browser.hostname
+    log.info('domain: ' + domain)
+
+    blog_id = post.blogId.attribute('content')
+    log.info('blogId: ' + blog_id)
+
+    post_id = post.postId.attribute('content')
+    log.info('postId: ' + post_id)
+
+    if post.title and post.body:
+        title = post.title.text
+        log.info('title: ' + title)
+
+        links = post.body.links
+        names = dict()
+
+        log.info('links: ' + ('[' if len(links) else '[]'))
+        for link in links:
+            url = link.attribute('href')
+            if not url:
+                continue
+
+            result = urlparse(url)
+
+            scheme = result.scheme
+            if scheme and scheme not in {'http', 'https'}:
+                continue
+
+            hostname = result.hostname
+            if not hostname or not hostname.endswith('.bp.blogspot.com'):
+                image = link.element(Selector.XPATH, './/img')
+                if image:
+                    src = image.attribute('src')
+                    if not src or not src.endswith('.bp.blogspot.com'):
+                        log.error('Unknown image url: ' + str(src))
+                        continue
+                else:
+                    log.error('Unknown link url: ' + str(url))
+                    continue
+
+            log.info('    ' + url)
+
+            path = result.path
+            file = os.path.basename(path)
+
+            count = names.setdefault(file, 0)
+            names[file] = count + 1
+
+            with tempfile.TemporaryFile() as fsrc:
+                try:
+                    browser.write(url, fsrc)
+                except IOError:
+                    log.exception("Error retrieving '%s'" % url)
+                    if args.skip:
+                        continue
+                    else:
+                        sys.exit(1)
+                fsrc.seek(0)
+
+                fmt = handle_format(fsrc.read())
+                if fmt is None:
+                    if args.skip:
+                        continue
+                    else:
+                        sys.exit(1)
+
+                template = {
+                    'domain': domain,
+                    'blogId': blog_id,
+                    'postId': post_id,
+                    'title': title,
+                    'file': file,
+                    'count': str(count),
+                    'fmt': fmt,
+                }
+
+                dst = handle_template(args.output, template)
+                if os.path.isfile(dst):
+                    log.warning('File exists: ' + dst)
+                    continue
+                else:
+                    delta = True
+                    if not args.pretend:
+                        fsrc.seek(0)
+                        directory = os.path.dirname(dst)
+                        if not os.path.exists(directory):
+                            os.makedirs(directory)
+                        with open(dst, mode='xb') as fdst:
+                            shutil.copyfileobj(fsrc, fdst)
+
+        if len(links):
+            log.info(']')
+
+        embeds = post.body.embeds
+        log.info('embeds: ' + ('[' if len(embeds) else '[]'))
+        for embed in embeds:
+            flashvars = embed.attribute('flashvars')
+            if not flashvars:
+                log.warning("Unknown embed")
+                continue
+
+            flvurl = parse_qs(flashvars).get('flvurl')
+            if not flvurl or not len(flvurl):
+                log.warning("Invalid flashvars: " + flashvars)
+                continue
+            else:
+                flvurl = flvurl[0]
+
+            log.info('    ' + flvurl)
+
+            id = parse_qs(urlparse(flvurl).query).get('id')
+            if not id or not len(id):
+                log.error("Unknown id: " + flvurl)
+                if args.skip:
+                    continue
+                else:
+                    sys.exit(1)
+            else:
+                id = id[0]
+
+            count = names.setdefault(id, 0)
+            names[id] = count + 1
+
+            with tempfile.TemporaryFile() as fsrc:
+                try:
+                    browser.write(flvurl, fsrc)
+                except IOError:
+                    log.exception("Error retrieving '%s'" % flvurl)
+                    if args.skip:
+                        continue
+                    else:
+                        sys.exit(1)
+                fsrc.seek(0)
+
+                fmt = handle_format(fsrc.read())
+                if fmt is None:
+                    if args.skip:
+                        continue
+                    else:
+                        sys.exit(1)
+
+                template = {
+                    'domain': domain,
+                    'blogId': blog_id,
+                    'postId': post_id,
+                    'title': title,
+                    'file': id,
+                    'count': str(0),
+                    'fmt': fmt,
+                }
+
+                dst = handle_template(args.output, template)
+                if os.path.isfile(dst):
+                    log.warning('File exists: ' + dst)
+                    continue
+                else:
+                    delta = True
+                    if not args.pretend:
+                        fsrc.seek(0)
+                        directory = os.path.dirname(dst)
+                        if not os.path.exists(directory):
+                            os.makedirs(directory)
+                        with open(dst, mode='xb') as fdst:
+                            shutil.copyfileobj(fsrc, fdst)
+
+        if len(embeds):
+            log.info(']')
+    else:
+        log.error('Missing Post Structure')
+        if not args.skip:
+            sys.exit(1)
+
+    if post.labels:
+        tags = post.labels.tags
+        log.info('tags: ' + ('[' if len(tags) else '[]'))
+        for tag in tags:
+            log.info('    ' + tag.text)
+        if len(tags):
+            log.info(']')
+
+    return delta
+
+
+def handle_format(buffer: bytes):
+    mime = magic.from_buffer(buffer, mime=True)
+    if not mime:
+        log.error('Unknown file type')
+        return None
+    else:
+        mime = mime.decode('ascii')
+
+    # Get all extensions, because guess_extension() random, (BUG: 3.x) -> https://bugs.python.org/issue4963
+    fmt = mimetypes.guess_all_extensions(mime, strict=True)
+    if not fmt or not len(fmt):
+        log.error('Unknown mime type: ' + mime)
+        return None
+    else:
+        # Sort extensions, because guess_all_extensions() unordered, (BUG: 3.x) -> https://bugs.python.org/issue4963
+        return sorted(fmt)[0][1:]
+
+
+handle_blog(args.url)
+browser.quit()
