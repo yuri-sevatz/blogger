@@ -3,8 +3,9 @@
 from distutils.core import setup
 
 setup(
-    name='blogger',
+    name='blogger_dl',
     version='${PACKAGE_VERSION}',
     package_dir={'': '${CMAKE_CURRENT_SOURCE_DIR}'},
-    packages=['cvm']
+    packages=['blogger_dl'],
+    scripts=['${CMAKE_CURRENT_SOURCE_DIR}/blogger-dl'],
 )
